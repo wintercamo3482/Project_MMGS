@@ -1,0 +1,22 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+
+# Build outputs
+**/Debug/
+**/Release/
+**/x64/
+**/Win32/
+dist/
+
+# Compiled files
+*.obj
+*.iobj
+*.ipdb
+*.tlog
+*.log
+*.pdb
+*.ilk
+*.recipe
