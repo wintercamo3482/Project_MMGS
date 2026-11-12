@@ -2,7 +2,7 @@
 //   MediaConverter.cpp
 //
 // Description:
-//   Extracts media audio and encodes MP3 using Windows Media Foundation.
+//   Decodes media audio with Media Foundation; outputs MP3 or PCM WAV.
 //   No FFmpeg executable or third-party codec is required.
 
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +19,7 @@
 #include "MediaConverter.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cwchar>
 #include <string>
@@ -68,6 +69,29 @@ namespace mmgs
                 if (mb1_com_initialized)
                 {
                     CoUninitialize();
+                }
+            }
+        };
+
+        struct WaveFile
+        {
+            HANDLE mo_handle = INVALID_HANDLE_VALUE;
+            uint64_t u64_data_bytes = 0;
+
+            ~WaveFile()
+            {
+                if (mo_handle != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(mo_handle);
+                }
+            }
+
+            void Close()
+            {
+                if (mo_handle != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(mo_handle);
+                    mo_handle = INVALID_HANDLE_VALUE;
                 }
             }
         };
@@ -144,13 +168,173 @@ namespace mmgs
         }
 
         // Temporary file stays on the destination volume for atomic replacement.
-        std::wstring MakeTempPath(const std::wstring& RO_destination)
+        std::wstring MakeTempPath(const std::wstring& RO_destination,
+            AudioFormat o_format)
         {
             std::wstring o_ret = RO_destination + L".mmgs-" +
                 std::to_wstring(GetCurrentProcessId()) + L"-" +
                 std::to_wstring(GetCurrentThreadId()) + L"-" +
-                std::to_wstring(GetTickCount64()) + L".mp3";
+                std::to_wstring(GetTickCount64()) +
+                (o_format == AudioFormat::Wav ? L".wav" : L".mp3");
             return o_ret;
+        }
+
+        // WAV files use a standard 44-byte RIFF/WAVE header and 16-bit PCM.
+        // RIFF stores sizes in 32-bit fields; reject >4 GiB rather than corrupting output.
+        void SetLe16(std::array<BYTE, 44>& o_header, size_t u64_offset, uint16_t u16_value)
+        {
+            o_header[u64_offset] = static_cast<BYTE>(u16_value & 0xFF);
+            o_header[u64_offset + 1] = static_cast<BYTE>((u16_value >> 8) & 0xFF);
+        }
+
+        void SetLe32(std::array<BYTE, 44>& o_header, size_t u64_offset, uint32_t u32_value)
+        {
+            for (size_t u64_i = 0; u64_i < 4; ++u64_i)
+            {
+                o_header[u64_offset + u64_i] =
+                    static_cast<BYTE>((u32_value >> (u64_i * 8)) & 0xFF);
+            }
+        }
+
+        bool WriteWaveHeader(HANDLE o_handle, UINT32 u32_rate, UINT32 u32_channels,
+            uint32_t u32_data_bytes, std::wstring& o_error)
+        {
+            bool b1_ret = false;
+            std::array<BYTE, 44> o_header{};
+            o_header[0] = 'R'; o_header[1] = 'I';
+            o_header[2] = 'F'; o_header[3] = 'F';
+            o_header[8] = 'W'; o_header[9] = 'A';
+            o_header[10] = 'V'; o_header[11] = 'E';
+            o_header[12] = 'f'; o_header[13] = 'm';
+            o_header[14] = 't'; o_header[15] = ' ';
+            o_header[36] = 'd'; o_header[37] = 'a';
+            o_header[38] = 't'; o_header[39] = 'a';
+
+            SetLe32(o_header, 4, 36U + u32_data_bytes);
+            SetLe32(o_header, 16, 16U); // PCM fmt chunk size
+            SetLe16(o_header, 20, 1U);  // WAVE_FORMAT_PCM
+            SetLe16(o_header, 22, static_cast<uint16_t>(u32_channels));
+            SetLe32(o_header, 24, u32_rate);
+            SetLe32(o_header, 28, u32_rate * u32_channels * MMGS_PCM_BYTES_PER_SAMPLE);
+            SetLe16(o_header, 32, static_cast<uint16_t>(u32_channels * MMGS_PCM_BYTES_PER_SAMPLE));
+            SetLe16(o_header, 34, MMGS_PCM_BITS_PER_SAMPLE);
+            SetLe32(o_header, 40, u32_data_bytes);
+
+            LARGE_INTEGER o_position{};
+            if (!SetFilePointerEx(o_handle, o_position, nullptr, FILE_BEGIN))
+            {
+                o_error = L"Could not seek to WAV header (Win32 error " +
+                    std::to_wstring(GetLastError()) + L").";
+                return b1_ret;
+            }
+
+            DWORD u32_written = 0;
+            if (!WriteFile(o_handle, o_header.data(),
+                static_cast<DWORD>(o_header.size()), &u32_written, nullptr) ||
+                u32_written != o_header.size())
+            {
+                o_error = L"Could not write WAV header (Win32 error " +
+                    std::to_wstring(GetLastError()) + L").";
+                return b1_ret;
+            }
+
+            b1_ret = true;
+            return b1_ret;
+        }
+
+        bool StartWaveFile(const std::wstring& RO_path, UINT32 u32_rate,
+            UINT32 u32_channels, WaveFile& o_file,
+            std::wstring& o_error)
+        {
+            bool b1_ret = false;
+            o_file.mo_handle = CreateFileW(RO_path.c_str(), GENERIC_WRITE, 0,
+                nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (o_file.mo_handle == INVALID_HANDLE_VALUE)
+            {
+                o_error = L"Could not create WAV output (Win32 error " +
+                    std::to_wstring(GetLastError()) + L").";
+                return b1_ret;
+            }
+
+            b1_ret = WriteWaveHeader(o_file.mo_handle, u32_rate, u32_channels, 0, o_error);
+            return b1_ret;
+        }
+
+        bool WriteWaveSample(IMFSample* o_sample, WaveFile& o_file,
+            UINT32 u32_channels, std::wstring& o_error)
+        {
+            bool b1_ret = false;
+            ComPtr<IMFMediaBuffer> o_buffer;
+            HRESULT s32_hr = o_sample->ConvertToContiguousBuffer(o_buffer.GetAddressOf());
+            if (!CheckHResult(s32_hr, L"Convert decoded audio buffer", o_error))
+            {
+                return b1_ret;
+            }
+
+            BYTE* a_buffer = nullptr;
+            DWORD u32_max_length = 0;
+            DWORD u32_data_length = 0;
+            s32_hr = o_buffer->Lock(&a_buffer, &u32_max_length, &u32_data_length);
+            if (!CheckHResult(s32_hr, L"Lock decoded audio buffer", o_error))
+            {
+                return b1_ret;
+            }
+
+            const DWORD u32_frame_size = u32_channels * MMGS_PCM_BYTES_PER_SAMPLE;
+            if (u32_data_length % u32_frame_size != 0)
+            {
+                o_error = L"Decoded PCM sample is not aligned to an audio frame.";
+            }
+            else if (o_file.u64_data_bytes + u32_data_length > 0xFFFFFFFFULL - 36ULL)
+            {
+                o_error = L"WAV exceeds the 4 GiB RIFF limit. Split the input media.";
+            }
+            else
+            {
+                DWORD u32_written = 0;
+                if (WriteFile(o_file.mo_handle, a_buffer, u32_data_length,
+                    &u32_written, nullptr) && u32_written == u32_data_length)
+                {
+                    o_file.u64_data_bytes += u32_written;
+                    b1_ret = true;
+                }
+                else
+                {
+                    o_error = L"Could not write WAV audio data (Win32 error " +
+                        std::to_wstring(GetLastError()) + L").";
+                }
+            }
+
+            o_buffer->Unlock();
+            return b1_ret;
+        }
+
+        bool FinishWaveFile(WaveFile& o_file, UINT32 u32_rate,
+            UINT32 u32_channels, std::wstring& o_error)
+        {
+            bool b1_ret = false;
+            if (o_file.u64_data_bytes == 0)
+            {
+                o_error = L"No decoded audio was written to the WAV file.";
+                return b1_ret;
+            }
+
+            if (!WriteWaveHeader(o_file.mo_handle, u32_rate, u32_channels,
+                static_cast<uint32_t>(o_file.u64_data_bytes), o_error))
+            {
+                return b1_ret;
+            }
+
+            if (!FlushFileBuffers(o_file.mo_handle))
+            {
+                o_error = L"Could not flush WAV output (Win32 error " +
+                    std::to_wstring(GetLastError()) + L").";
+                return b1_ret;
+            }
+
+            o_file.Close();
+            b1_ret = true;
+            return b1_ret;
         }
 
         HRESULT CreatePcmType(UINT32 u32_rate, UINT32 u32_channels,
@@ -350,6 +534,7 @@ namespace mmgs
 
         bool ConvertCore(const std::wstring& RO_source,
             const std::wstring& RO_temporary,
+            AudioFormat o_format,
             const ProgressCallback& RO_on_progress,
             const LogCallback& RO_on_log,
             std::wstring& o_error)
@@ -426,60 +611,68 @@ namespace mmgs
                 Log(RO_on_log, L"Duration unavailable: progress will complete at the end.");
             }
 
-            Log(RO_on_log, L"Configuring MP3 sink writer...");
             ComPtr<IMFSinkWriter> o_writer;
-            s32_hr = MFCreateSinkWriterFromURL(
-                RO_temporary.c_str(), nullptr, nullptr, o_writer.GetAddressOf());
-
-            if (!CheckHResult(s32_hr, L"Create MP3 sink writer", o_error))
-            {
-                return b1_ret;
-            }
-
-            ComPtr<IMFMediaType> o_mp3_type;
-            s32_hr = CreateMp3Type(u32_rate, u32_channels, o_mp3_type.GetAddressOf());
-
-            if (!CheckHResult(s32_hr, L"Set MP3 format", o_error))
-            {
-                return b1_ret;
-            }
-
+            WaveFile o_wave_file;
             DWORD u32_stream_index = 0;
-            s32_hr = o_writer->AddStream(o_mp3_type.Get(), &u32_stream_index);
 
-            if (!CheckHResult(s32_hr, L"Add MP3 output stream", o_error))
+            if (o_format == AudioFormat::Wav)
             {
-                return b1_ret;
+                Log(RO_on_log, L"Writing WAV (16-bit PCM, uncompressed)...");
+                if (!StartWaveFile(RO_temporary, u32_rate, u32_channels,
+                    o_wave_file, o_error))
+                {
+                    return b1_ret;
+                }
             }
-
-            ComPtr<IMFMediaType> o_pcm_type;
-            s32_hr = o_reader->GetCurrentMediaType(
-                MF_SOURCE_READER_FIRST_AUDIO_STREAM, o_pcm_type.GetAddressOf());
-
-            if (!CheckHResult(s32_hr, L"Get decoded PCM type", o_error))
+            else
             {
-                return b1_ret;
+                Log(RO_on_log, L"Configuring MP3 sink writer...");
+                s32_hr = MFCreateSinkWriterFromURL(
+                    RO_temporary.c_str(), nullptr, nullptr, o_writer.GetAddressOf());
+                if (!CheckHResult(s32_hr, L"Create MP3 sink writer", o_error))
+                {
+                    return b1_ret;
+                }
+
+                ComPtr<IMFMediaType> o_mp3_type;
+                s32_hr = CreateMp3Type(u32_rate, u32_channels, o_mp3_type.GetAddressOf());
+                if (!CheckHResult(s32_hr, L"Set MP3 format", o_error))
+                {
+                    return b1_ret;
+                }
+
+                s32_hr = o_writer->AddStream(o_mp3_type.Get(), &u32_stream_index);
+                if (!CheckHResult(s32_hr, L"Add MP3 output stream", o_error))
+                {
+                    return b1_ret;
+                }
+
+                ComPtr<IMFMediaType> o_pcm_type;
+                s32_hr = o_reader->GetCurrentMediaType(
+                    MF_SOURCE_READER_FIRST_AUDIO_STREAM, o_pcm_type.GetAddressOf());
+                if (!CheckHResult(s32_hr, L"Get decoded PCM type", o_error))
+                {
+                    return b1_ret;
+                }
+
+                s32_hr = o_writer->SetInputMediaType(
+                    u32_stream_index, o_pcm_type.Get(), nullptr);
+                if (!CheckHResult(s32_hr, L"Connect Windows MP3 encoder", o_error))
+                {
+                    o_error += L"\nThe Windows MP3 encoder may be unavailable or incompatible.";
+                    return b1_ret;
+                }
+
+                s32_hr = o_writer->BeginWriting();
+                if (!CheckHResult(s32_hr, L"Start MP3 output", o_error))
+                {
+                    return b1_ret;
+                }
+
+                Log(RO_on_log, L"Encoding MP3 (" +
+                    std::to_wstring(u32_channels == MMGS_AUDIO_MONO ?
+                        MMGS_MP3_MONO_KBPS : MMGS_MP3_STEREO_KBPS) + L" kbps CBR)...");
             }
-
-            s32_hr = o_writer->SetInputMediaType(
-                u32_stream_index, o_pcm_type.Get(), nullptr);
-
-            if (!CheckHResult(s32_hr, L"Connect Windows MP3 encoder", o_error))
-            {
-                o_error += L"\nThe built-in MP3 encoder may be unavailable or incompatible with the selected format.";
-                return b1_ret;
-            }
-
-            s32_hr = o_writer->BeginWriting();
-
-            if (!CheckHResult(s32_hr, L"Start MP3 output", o_error))
-            {
-                return b1_ret;
-            }
-
-            Log(RO_on_log, L"Encoding MP3 (" +
-                std::to_wstring(u32_channels == MMGS_AUDIO_MONO ?
-                    MMGS_MP3_MONO_KBPS : MMGS_MP3_STEREO_KBPS) + L" kbps CBR)...");
 
             bool b1_have_base_time = false;
             LONGLONG s64_first_time = 0;
@@ -564,20 +757,29 @@ namespace mmgs
                     s64_sample_duration = MMGS_MIN_SAMPLE_DURATION;
                 }
 
-                s32_hr = o_sample->SetSampleTime(s64_write_time);
-
-                if (SUCCEEDED(s32_hr))
+                if (o_format == AudioFormat::Wav)
                 {
-                    s32_hr = o_sample->SetSampleDuration(s64_sample_duration);
+                    if (!WriteWaveSample(o_sample.Get(), o_wave_file,
+                        u32_channels, o_error))
+                    {
+                        return b1_ret;
+                    }
                 }
-                if (SUCCEEDED(s32_hr))
+                else
                 {
-                    s32_hr = o_writer->WriteSample(u32_stream_index, o_sample.Get());
-                }
-
-                if (!CheckHResult(s32_hr, L"Encode/write MP3 sample", o_error))
-                {
-                    return b1_ret;
+                    s32_hr = o_sample->SetSampleTime(s64_write_time);
+                    if (SUCCEEDED(s32_hr))
+                    {
+                        s32_hr = o_sample->SetSampleDuration(s64_sample_duration);
+                    }
+                    if (SUCCEEDED(s32_hr))
+                    {
+                        s32_hr = o_writer->WriteSample(u32_stream_index, o_sample.Get());
+                    }
+                    if (!CheckHResult(s32_hr, L"Encode/write MP3 sample", o_error))
+                    {
+                        return b1_ret;
+                    }
                 }
 
                 ++u64_sample_count;
@@ -615,32 +817,40 @@ namespace mmgs
                 return b1_ret;
             }
 
-            s32_hr = o_writer->Finalize();
-
-            if (!CheckHResult(s32_hr, L"Finalize MP3 file", o_error))
+            if (o_format == AudioFormat::Wav)
             {
-                return b1_ret;
+                if (!FinishWaveFile(o_wave_file, u32_rate, u32_channels, o_error))
+                {
+                    return b1_ret;
+                }
+            }
+            else
+            {
+                s32_hr = o_writer->Finalize();
+                if (!CheckHResult(s32_hr, L"Finalize MP3 file", o_error))
+                {
+                    return b1_ret;
+                }
+                o_writer.Reset();
             }
 
-            // Release open handles before moving the completed MP3.
-            o_writer.Reset();
             o_reader.Reset();
-
             if (!FileHasData(RO_temporary))
             {
-                o_error = L"MP3 output was empty after finalization.";
+                o_error = L"Output audio file was empty after finalization.";
                 return b1_ret;
             }
 
-            Log(RO_on_log, L"Encoded audio samples: " +
+            Log(RO_on_log, L"Processed audio samples: " +
                 std::to_wstring(u64_sample_count));
             b1_ret = true;
             return b1_ret;
         }
     }
 
-    bool ConvertMediaToMp3(const std::wstring& RO_source,
+    bool ConvertMediaToAudio(const std::wstring& RO_source,
         const std::wstring& RO_destination,
+        AudioFormat o_format,
         const ProgressCallback& RO_on_progress,
         const LogCallback& RO_on_log,
         std::wstring& o_error)
@@ -648,10 +858,10 @@ namespace mmgs
         bool b1_ret = false;
         o_error.clear();
 
-        const std::wstring o_temp_path = MakeTempPath(RO_destination);
+        const std::wstring o_temp_path = MakeTempPath(RO_destination, o_format);
         TempFileCleanup o_cleanup{ o_temp_path };
 
-        if (!ConvertCore(RO_source, o_temp_path,
+        if (!ConvertCore(RO_source, o_temp_path, o_format,
             RO_on_progress, RO_on_log, o_error))
         {
             Log(RO_on_log, L"Failed: " + o_error);
@@ -661,7 +871,7 @@ namespace mmgs
         if (!MoveFileExW(o_temp_path.c_str(), RO_destination.c_str(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         {
-            o_error = L"Could not move the completed MP3 into its destination (Win32 error " +
+            o_error = L"Could not move the completed audio file into its destination (Win32 error " +
                 std::to_wstring(GetLastError()) + L").";
             Log(RO_on_log, L"Failed: " + o_error);
             return b1_ret;

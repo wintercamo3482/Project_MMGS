@@ -126,10 +126,12 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp" />
+    <ClCompile Include="ConverterFrame.cpp" />
+    <ClCompile Include="MMGSApp.cpp" />
     <ClCompile Include="MediaConverter.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ConverterFrame.h" />
     <ClInclude Include="MMGSVersion.h" />
     <ClInclude Include="MediaConverter.h" />
   </ItemGroup>

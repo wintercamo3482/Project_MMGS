@@ -1,12 +1,14 @@
 # Meeting Minutes Generation System
 
-**MMGS (Meeting Minutes Generation System)** is a Windows desktop utility being developed to process media files and eventually generate meeting minutes.
+**MMGS (Meeting Minutes Generation System)** is a Windows desktop utility designed to process media files, with the long-term goal of automatically generating meeting minutes.
 
-## Current Features (v1.0.0)
+## Current Features (v1.1.0)
 
-- Convert MP4 audio to MP3 using Windows Media Foundation.
-- Select an input file and output directory.
-- View conversion progress and logs in the application window.
+- Convert MP4 audio to MP3 or WAV using Windows Media Foundation.
+- Select the output audio format (MP3 / WAV).
+- Customize output file names and save locations.
+- Monitor conversion progress and logs within the application.
+- Optionally open the output folder and highlight the converted file.
 - Display success and error notifications.
 - Run without a separate FFmpeg installation.
 
@@ -21,4 +23,4 @@ Open `MMGS.sln`, select **Release | x64**, and build the solution.
 ## Notes
 
 - Supported input codecs depend on the Media Foundation components available on Windows.
-- Meeting-minute generation is a planned feature and is not included in v1.0.0.
+- Meeting-minute generation is a planned feature and is not included in v1.1.0.

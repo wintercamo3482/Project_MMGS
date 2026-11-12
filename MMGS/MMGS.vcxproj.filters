@@ -15,10 +15,13 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp">
+    <ClCompile Include="MMGSApp.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
     <ClCompile Include="MediaConverter.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="ConverterFrame.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
   </ItemGroup>
@@ -27,6 +30,9 @@
       <Filter>헤더 파일</Filter>
     </ClInclude>
     <ClInclude Include="MMGSVersion.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="ConverterFrame.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
   </ItemGroup>
